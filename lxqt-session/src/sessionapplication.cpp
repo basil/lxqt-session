@@ -27,6 +27,7 @@
 #include <csignal>
 #include <LXQt/Settings>
 #include <LXQt/Globals>
+#include <XdgProcess>
 #include <QMessageBox>
 #include <QProcess>
 #include <QGuiApplication>
@@ -109,7 +110,7 @@ bool SessionApplication::startup()
                     //      but with such a little probablity we can live...
                     LXQt::Settings settings(configName);
                     loadKeyboardSettings(settings);
-                    QProcess::startDetached(QStringLiteral("lxqt-config-input"), QStringList(QStringLiteral("--load-touchpad")));
+                    XdgProcess::startDetached(QStringLiteral("lxqt-config-input"), QStringList(QStringLiteral("--load-touchpad")), QString(), QStringLiteral("app.slice"));
                 });
         connect(dev_notifier, &UdevNotifier::deviceAdded, this, [this, dev_timer] (QString device)
                 {
@@ -126,7 +127,7 @@ bool SessionApplication::startup()
         connect(dev_notifier_drm_subsystem, &UdevNotifier::deviceChanged, this, [this] (QString device)
                 {
                     qCWarning(SESSION) << QStringLiteral("Session '%1': display device '%2'").arg(configName,device);
-                    QProcess::startDetached(QStringLiteral("lxqt-config-monitor"), QStringList(QStringLiteral("-l")));
+                    XdgProcess::startDetached(QStringLiteral("lxqt-config-monitor"), QStringList(QStringLiteral("-l")), QString(), QStringLiteral("app.slice"));
                 });
 #endif
     }
@@ -198,7 +199,7 @@ void SessionApplication::setxkbmap(QString layout, QString variant, QString mode
   }
   // execute the command line
   if (!args.isEmpty())
-      QProcess::startDetached(QStringLiteral("setxkbmap"), args);
+      XdgProcess::startDetached(QStringLiteral("setxkbmap"), args, QString(), QStringLiteral("app.slice"));
 }
 
 void SessionApplication::loadKeyboardSettings(LXQt::Settings& settings)

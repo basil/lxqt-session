@@ -29,6 +29,7 @@
 #define LXQTMODMAN_H
 
 #include <QAbstractNativeEventFilter>
+#include <QDBusObjectPath>
 #include <QProcess>
 #include <QList>
 #include <QMap>
@@ -46,8 +47,6 @@ class QFileSystemWatcher;
 
 typedef QMap<QString,LXQtModule*> ModulesMap;
 typedef QMapIterator<QString,LXQtModule*> ModulesMapIterator;
-typedef QList<time_t> ModuleCrashReport;
-typedef QMap<QProcess*, ModuleCrashReport> ModulesCrashReport;
 
 /*! \brief LXQtModuleManager manages the processes of the session
 and which modules of lxqt are about to load.
@@ -130,11 +129,6 @@ private:
     //! \brief the window manager
     QProcess* mWmProcess;
 
-    /*! \brief Keep creashes for given process to raise a message in the
-        case of repeating crashes
-     */
-    ModulesCrashReport mCrashReport;
-
     //! \brief file system watcher to react on theme modifications
     QFileSystemWatcher *mThemeWatcher;
     QString mCurrentThemePath;
@@ -157,11 +151,7 @@ private slots:
     If the process crashed and is set as "doespower" it's tried to
     be restarted automatically.
     */
-    void restartModules(int exitCode, QProcess::ExitStatus exitStatus);
-
-    /*! Clear m_crashReport after some amount of time
-     */
-    void resetCrashReport();
+    void restartModules();
 
     void themeFolderChanged(const QString&);
 
@@ -185,26 +175,55 @@ See lxqt_setenv.
 */
 void lxqt_setenv_prepend(const char *env, const QByteArray &value, const QByteArray &separator=":");
 
-class LXQtModule : public QProcess
+class LXQtModule : public QObject
 {
     Q_OBJECT
 public:
-    LXQtModule(const XdgDesktopFile& file, QObject *parent = nullptr);
-    void start();
-    void terminate();
-    bool isTerminating();
+    enum class State {
+        Unknown,
+        Inactive,
+        Starting,
+        Active,
+        Failed
+    };
+    Q_ENUM(State)
 
-    const XdgDesktopFile file;
-    const QString fileName;
+    LXQtModule(const XdgDesktopFile &file,
+               const QString &unitName,
+               const QDBusObjectPath &unitPath,
+               QObject *parent = nullptr);
+
+    QString moduleName() const { return mFileName; }   // e.g. "lxqt-panel.desktop"
+    QString unitName() const { return mUnitName; }
+    State state() const { return mState; }
+
+public slots:
+    void stop();    // StopUnit via systemd
+    void restart(); // ResetFailedUnit + RestartUnit via systemd
 
 signals:
-    void moduleStateChanged(QString name, bool state);
+    // Detailed state (new API)
+    void stateChanged(LXQtModule::State newState);
+
+    // Existing manager signal semantic: module running/not running
+    void moduleStateChanged(QString name, bool running);
+
+    // Emitted when systemd puts the unit into "failed"
+    void failed();
 
 private slots:
-    void updateState(QProcess::ProcessState newState);
+    void onUnitPropertiesChanged(const QString &interface,
+                                 const QVariantMap &changed,
+                                 const QStringList &invalidated);
 
 private:
-    bool mIsTerminating;
+    static State stateFromActiveState(const QString &activeState);
+
+    XdgDesktopFile mFile;
+    QString mFileName;      // basename of .desktop file
+    QString mUnitName;      // systemd unit name, e.g. "lxqt-module-lxqt-panel.service"
+    QDBusObjectPath mUnitPath;
+    State mState;
 };
 
 #endif

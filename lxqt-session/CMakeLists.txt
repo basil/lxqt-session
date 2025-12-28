@@ -26,6 +26,8 @@ set(lxqt-session_SRCS
     src/sessiondbusadaptor.h
     src/lockscreenmanager.cpp
     src/lockscreenmanager.h
+    src/meta_types.cpp
+    src/meta_types.h
     src/numlock.cpp
     src/numlock.h
     src/log.cpp

@@ -27,6 +27,7 @@
  * END_COMMON_COPYRIGHT_HEADER */
 
 #include "lxqtmodman.h"
+#include "meta_types.h"
 #include <LXQt/Globals>
 #include <LXQt/Settings>
 #include <XdgAutoStart>
@@ -34,6 +35,13 @@
 #include <unistd.h>
 
 #include <QApplication>
+#include <QDBusConnection>
+#include <QDBusConnectionInterface>
+#include <QDBusInterface>
+#include <QDBusMessage>
+#include <QDBusObjectPath>
+#include <QDBusReply>
+#include <QRegularExpression>
 #include <QMessageBox>
 #include <QSystemTrayIcon>
 #include <QFileInfo>
@@ -49,8 +57,6 @@
 
 #include <KWindowSystem>
 #include <NETWM>
-
-#define MAX_CRASHES_PER_APP 5
 
 using namespace LXQt;
 
@@ -243,11 +249,152 @@ void LXQtModuleManager::startWm(LXQt::Settings *settings)
     //         Maybe we can add a X-Wait-WM=true key in the desktop entry file?
 }
 
+namespace {
+
+// Valid chars for the "unit name prefix": ASCII letters, digits, ':', '-', '_', '.', '\\'
+static bool isValidUnitChar(QChar c)
+{
+    const ushort u = c.unicode();
+    if ((u >= 'a' && u <= 'z') ||
+        (u >= 'A' && u <= 'Z') ||
+        (u >= '0' && u <= '9')) {
+        return true;
+    }
+
+    return c == QLatin1Char(':') ||
+           c == QLatin1Char('-') ||
+           c == QLatin1Char('_') ||
+           c == QLatin1Char('.') ||
+           c == QLatin1Char('\\');
+}
+
+static QString systemdEscape(const QString &input)
+{
+    QString out = input;
+    for (QChar &ch : out) {
+        if (!isValidUnitChar(ch)) {
+            ch = QLatin1Char('_');
+        }
+    }
+    return out;
+}
+
+// Stable name for LXQt modules: lxqt-module-<desktop-id>.service
+static QString moduleUnitName(const XdgDesktopFile &file)
+{
+    // Prefer desktop file ID if available; otherwise use basename
+    QString id = XdgDesktopFile::id(file.fileName(), /*checkFileExists*/ false);
+    if (id.isEmpty())
+        id = QFileInfo(file.fileName()).completeBaseName();
+
+    QString prefix = QStringLiteral("lxqt-module-%1").arg(id);
+    prefix = systemdEscape(prefix);
+
+    // Keep margin for ".service" suffix, systemd's 255-char limit
+    constexpr qsizetype maxPrefixLen = 240;
+    if (prefix.size() > maxPrefixLen)
+        prefix.truncate(maxPrefixLen);
+
+    return prefix + QStringLiteral(".service");
+}
+
+// Start a transient service unit for a module under session.slice.
+// Returns true and fills unitPathOut on success.
+static bool startModuleTransientUnit(const QString &unitName,
+                                     const QString &program,
+                                     const QStringList &arguments,
+                                     const QString &workingDirectory,
+                                     const XdgDesktopFile &file,
+                                     QDBusObjectPath &unitPathOut)
+{
+    const QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) {
+        qCWarning(SESSION) << "Cannot connect to D-Bus session bus to start module" << unitName;
+        return false;
+    }
+
+    QDBusConnectionInterface *iface = bus.interface();
+    if (!iface || !iface->isServiceRegistered(QStringLiteral("org.freedesktop.systemd1"))) {
+        qCWarning(SESSION) << "org.freedesktop.systemd1 is not available on the session bus";
+        return false;
+    }
+
+    SystemdDBusPropertyList properties;
+
+    // Description from Name / GenericName
+    const QString name = file.localizedValue(QStringLiteral("Name")).toString();
+    const QString genericName = file.localizedValue(QStringLiteral("GenericName")).toString();
+    QString description;
+    if (name.isEmpty())
+        description = genericName;
+    else if (genericName.isEmpty())
+        description = name;
+    else
+        description = name + QStringLiteral(" - ") + genericName;
+
+    if (description.isEmpty())
+        description = QFileInfo(program).fileName();
+
+    properties.append({QStringLiteral("Description"), description});
+    properties.append({QStringLiteral("Slice"), QStringLiteral("session.slice")});
+    properties.append({QStringLiteral("CollectMode"), QStringLiteral("inactive-or-failed")});
+    properties.append({QStringLiteral("Type"), QStringLiteral("exec")});
+    properties.append({QStringLiteral("ExitType"), QStringLiteral("cgroup")});
+
+    if (!workingDirectory.isEmpty())
+        properties.append({QStringLiteral("WorkingDirectory"), workingDirectory});
+
+    // Delegate crash handling to systemd:
+    // - Restart on failure
+    // - Apply a modest start limit (roughly 5 crashes per 60 seconds)
+    properties.append({QStringLiteral("Restart"), QStringLiteral("on-failure")});
+    properties.append({QStringLiteral("StartLimitIntervalUSec"), quint64(60ull * 1000000ull)}); // 60s
+    properties.append({QStringLiteral("StartLimitBurst"), quint32(5)});
+
+    SystemdDBusExecCommand execCmd;
+    execCmd.path = program;
+    execCmd.args = QStringList{program} + arguments;
+    execCmd.ignoreFailure = false;
+
+    SystemdDBusExecCommandList commands;
+    commands.append(execCmd);
+    properties.append({
+        QStringLiteral("ExecStart"),
+        QVariant::fromValue(commands)
+    });
+
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QStringLiteral("org.freedesktop.systemd1"),
+        QStringLiteral("/org/freedesktop/systemd1"),
+        QStringLiteral("org.freedesktop.systemd1.Manager"),
+        QStringLiteral("StartTransientUnit")
+    );
+
+    msg << unitName << QStringLiteral("fail");
+    msg << QVariant::fromValue(properties);
+
+    SystemdDBusAuxUnitList auxUnits;
+    msg << QVariant::fromValue(auxUnits);
+
+    QDBusReply<QDBusObjectPath> reply = bus.call(msg);
+    if (!reply.isValid()) {
+        qCWarning(SESSION) << "Failed to StartTransientUnit for" << unitName
+                           << ":" << reply.error().message();
+        return false;
+    }
+
+    unitPathOut = reply.value();
+    return true;
+}
+
+}
+
+
 void LXQtModuleManager::startProcess(const XdgDesktopFile& file)
 {
     if (!file.value(QL1S("X-LXQt-Module"), false).toBool())
     {
-        file.startDetached();
+        file.startDetached(QStringList(), QStringLiteral("app.slice"));
         return;
     }
     QStringList args = file.expandExecString();
@@ -256,14 +403,37 @@ void LXQtModuleManager::startProcess(const XdgDesktopFile& file)
         qCWarning(SESSION) << "Wrong desktop file" << file.fileName();
         return;
     }
-    LXQtModule* proc = new LXQtModule(file, this);
-    connect(proc, &LXQtModule::moduleStateChanged, this, &LXQtModuleManager::moduleStateChanged);
-    proc->start();
 
-    QString name = QFileInfo(file.fileName()).fileName();
-    mNameMap[name] = proc;
+    QString program = args.takeFirst();
+    QString workingDir = file.value(QL1S("Path")).toString();
+    if (!workingDir.isEmpty() && !QDir(workingDir).exists())
+        workingDir.clear();
 
-    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &LXQtModuleManager::restartModules);
+    const QString unitName = moduleUnitName(file);
+    QDBusObjectPath unitPath;
+
+    if (!startModuleTransientUnit(unitName, program, args, workingDir, file, unitPath)) {
+        qCWarning(SESSION) << "Failed to start LXQt module as transient unit:" << file.fileName();
+        return;
+    }
+
+    auto *module = new LXQtModule(file, unitName, unitPath, this);
+    connect(module, &LXQtModule::moduleStateChanged,
+            this, &LXQtModuleManager::moduleStateChanged);
+
+    const QString name = QFileInfo(file.fileName()).fileName();
+
+    // If we somehow already have a module object for this name, drop it
+    if (auto old = mNameMap.value(name, nullptr)) {
+        disconnect(old, nullptr, this, nullptr);
+        old->deleteLater();
+    }
+
+    mNameMap[name] = module;
+
+    // When the systemd unit fails, delegate restart to systemd via restartModules()
+    connect(module, &LXQtModule::failed,
+            this, &LXQtModuleManager::restartModules);
 }
 
 void LXQtModuleManager::startProcess(const QString& name)
@@ -282,10 +452,17 @@ void LXQtModuleManager::startProcess(const QString& name)
     }
 }
 
-void LXQtModuleManager::stopProcess(const QString& name)
+void LXQtModuleManager::stopProcess(const QString &name)
 {
-    if (mNameMap.contains(name))
-        mNameMap[name]->terminate();
+    auto it = mNameMap.constFind(name);
+    if (it == mNameMap.constEnd())
+        return;
+
+    LXQtModule *module = it.value();
+    if (!module)
+        return;
+
+    module->stop();
 }
 
 void LXQtModuleManager::execDesktopFile(const QString& name)
@@ -301,7 +478,7 @@ void LXQtModuleManager::execDesktopFile(const QString& name)
         qCWarning(SESSION) << "Desktop file" << name << "is not applicable";
         return;
     }
-    xdg.startDetached();
+    xdg.startDetached(QStringList(), QStringLiteral("app.slice"));
 }
 
 QStringList LXQtModuleManager::listModules() const
@@ -317,47 +494,18 @@ void LXQtModuleManager::startConfUpdate()
     startProcess(desktop);
 }
 
-void LXQtModuleManager::restartModules(int exitCode, QProcess::ExitStatus exitStatus)
+void LXQtModuleManager::restartModules()
 {
-    LXQtModule* proc = qobject_cast<LXQtModule*>(sender());
-    if (nullptr == proc) {
-        qCWarning(SESSION) << "Got an invalid (null) module to restart. Ignoring it";
+    LXQtModule *module = qobject_cast<LXQtModule*>(sender());
+    if (!module) {
+        qCWarning(SESSION) << "restartModules called without a valid LXQtModule sender";
         return;
     }
 
-    if (!proc->isTerminating())
-    {
-        QString procName = proc->file.name();
-        switch (exitStatus)
-        {
-            case QProcess::NormalExit:
-                qCDebug(SESSION) << "Process" << procName << "(" << proc << ") exited with code" << exitCode;
-                if (exitCode == 0)
-                    break;
-                // Falls through.
-            case QProcess::CrashExit:
-            {
-                qCDebug(SESSION) << "Process" << procName << "(" << proc << ") has to be restarted";
-                time_t now = time(nullptr);
-                mCrashReport[proc].prepend(now);
-                while (now - mCrashReport[proc].back() > 60)
-                    mCrashReport[proc].pop_back();
-                if (mCrashReport[proc].length() >= MAX_CRASHES_PER_APP)
-                {
-                    QMessageBox::warning(nullptr, tr("Crash Report"),
-                                        tr("<b>%1</b> crashed too many times. Its autorestart has been disabled until next login.").arg(procName));
-                }
-                else
-                {
-                    proc->start();
-                    return;
-                }
-                break;
-            }
-        }
-    }
-    mNameMap.remove(proc->fileName);
-    proc->deleteLater();
+    // This will:
+    //  - reset the failed state and counters (ResetFailedUnit)
+    //  - ask systemd to restart the service (RestartUnit)
+    module->restart();
 }
 
 
@@ -373,11 +521,13 @@ LXQtModuleManager::~LXQtModuleManager()
     while (i.hasNext())
     {
         i.next();
+        LXQtModule *m = i.value();
+        if (!m)
+            continue;
 
-        auto p = i.value();
-        disconnect(p);
-
-        delete p;
+        disconnect(m, nullptr, this, nullptr);
+        // Do not try to stop modules here; logout() already handles that.
+        delete m;
         mNameMap[i.key()] = nullptr;
     }
 
@@ -395,19 +545,9 @@ void LXQtModuleManager::logout(bool doExit)
     {
         i.next();
         qCDebug(SESSION) << "Module logout" << i.key();
-        LXQtModule* p = i.value();
-        p->terminate();
-    }
-    i.toFront();
-    while (i.hasNext())
-    {
-        i.next();
-        LXQtModule* p = i.value();
-        if (p->state() != QProcess::NotRunning && !p->waitForFinished(2000))
-        {
-            qCWarning(SESSION, "Module %s won't terminate ... killing.", qPrintable(i.key()));
-            p->kill();
-        }
+        LXQtModule *m = i.value();
+        if (m)
+            m->stop();
     }
 
     // terminate all possible children except WM
@@ -433,11 +573,6 @@ QString LXQtModuleManager::showWmSelectDialog()
     WmSelectDialog dlg(availableWM);
     dlg.exec();
     return dlg.windowManager();
-}
-
-void LXQtModuleManager::resetCrashReport()
-{
-    mCrashReport.clear();
 }
 
 void lxqt_setenv(const char *env, const QByteArray &value)
@@ -476,37 +611,160 @@ void lxqt_setenv_prepend(const char *env, const QByteArray &value, const QByteAr
     lxqt_setenv(env, orig);
 }
 
-LXQtModule::LXQtModule(const XdgDesktopFile& file, QObject* parent) :
-    QProcess(parent),
-    file(file),
-    fileName(QFileInfo(file.fileName()).fileName()),
-    mIsTerminating(false)
+
+LXQtModule::LXQtModule(const XdgDesktopFile &file,
+                       const QString &unitName,
+                       const QDBusObjectPath &unitPath,
+                       QObject *parent)
+    : QObject(parent)
+    , mFile(file)
+    , mFileName(QFileInfo(file.fileName()).fileName())
+    , mUnitName(unitName)
+    , mUnitPath(unitPath)
+    , mState(State::Unknown)
 {
-    QProcess::setProcessChannelMode(QProcess::ForwardedChannels);
-    connect(this, &LXQtModule::stateChanged, this, &LXQtModule::updateState);
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) {
+        qCWarning(SESSION) << "No session bus; cannot monitor module" << mFileName;
+        return;
+    }
+
+    // Connect to PropertiesChanged on the unit
+    const bool ok = bus.connect(
+        QStringLiteral("org.freedesktop.systemd1"),
+        mUnitPath.path(),
+        QStringLiteral("org.freedesktop.DBus.Properties"),
+        QStringLiteral("PropertiesChanged"),
+        this,
+        SLOT(onUnitPropertiesChanged(QString,QVariantMap,QStringList))
+    );
+
+    if (!ok) {
+        qCWarning(SESSION) << "Failed to connect to PropertiesChanged for" << mUnitName;
+    }
+
+    // Fetch initial ActiveState
+    QDBusInterface propsIface(
+        QStringLiteral("org.freedesktop.systemd1"),
+        mUnitPath.path(),
+        QStringLiteral("org.freedesktop.DBus.Properties"),
+        bus
+    );
+
+    if (!propsIface.isValid()) {
+        qCWarning(SESSION) << "Cannot create Properties interface for" << mUnitName;
+        return;
+    }
+
+    QDBusReply<QVariant> reply = propsIface.call(
+        QStringLiteral("Get"),
+        QStringLiteral("org.freedesktop.systemd1.Unit"),
+        QStringLiteral("ActiveState")
+    );
+
+    if (reply.isValid()) {
+        mState = stateFromActiveState(reply.value().toString());
+        emit stateChanged(mState);
+        emit moduleStateChanged(mFileName, mState == State::Active);
+    }
 }
 
-void LXQtModule::start()
+LXQtModule::State LXQtModule::stateFromActiveState(const QString &activeState)
 {
-    mIsTerminating = false;
-    QStringList args = file.expandExecString();
-    QString command = args.takeFirst();
-    QProcess::start(command, args);
+    if (activeState == QLatin1String("active"))
+        return State::Active;
+    if (activeState == QLatin1String("activating"))
+        return State::Starting;
+    if (activeState == QLatin1String("inactive") ||
+        activeState == QLatin1String("deactivating"))
+        return State::Inactive;
+    if (activeState == QLatin1String("failed"))
+        return State::Failed;
+
+    return State::Unknown;
 }
 
-void LXQtModule::terminate()
+void LXQtModule::onUnitPropertiesChanged(const QString &interface,
+                                         const QVariantMap &changed,
+                                         const QStringList &invalidated)
 {
-    mIsTerminating = true;
-    QProcess::terminate();
+    Q_UNUSED(invalidated);
+
+    if (interface != QStringLiteral("org.freedesktop.systemd1.Unit"))
+        return;
+
+    auto it = changed.find(QStringLiteral("ActiveState"));
+    if (it == changed.end())
+        return;
+
+    const QString activeState = it->toString();
+    const State newState = stateFromActiveState(activeState);
+
+    if (newState == mState)
+        return;
+
+    const bool wasRunning = (mState == State::Active);
+    const bool isRunning  = (newState == State::Active);
+
+    mState = newState;
+    emit stateChanged(mState);
+
+    if (wasRunning != isRunning)
+        emit moduleStateChanged(mFileName, isRunning);
+
+    if (mState == State::Failed)
+        emit failed();
 }
 
-bool LXQtModule::isTerminating()
+void LXQtModule::stop()
 {
-    return mIsTerminating;
+    QDBusInterface manager(
+        QStringLiteral("org.freedesktop.systemd1"),
+        QStringLiteral("/org/freedesktop/systemd1"),
+        QStringLiteral("org.freedesktop.systemd1.Manager"),
+        QDBusConnection::sessionBus()
+    );
+
+    if (!manager.isValid()) {
+        qCWarning(SESSION) << "Cannot create systemd Manager interface to stop" << mUnitName;
+        return;
+    }
+
+    QDBusReply<QDBusObjectPath> reply =
+        manager.call(QStringLiteral("StopUnit"), mUnitName, QStringLiteral("replace"));
+    if (!reply.isValid()) {
+        qCWarning(SESSION) << "Failed to StopUnit" << mUnitName
+                           << ":" << reply.error().message();
+    }
 }
 
-void LXQtModule::updateState(QProcess::ProcessState newState)
+void LXQtModule::restart()
 {
-    if (newState != QProcess::Starting)
-        emit moduleStateChanged(fileName, (newState == QProcess::Running));
+    QDBusInterface manager(
+        QStringLiteral("org.freedesktop.systemd1"),
+        QStringLiteral("/org/freedesktop/systemd1"),
+        QStringLiteral("org.freedesktop.systemd1.Manager"),
+        QDBusConnection::sessionBus()
+    );
+
+    if (!manager.isValid()) {
+        qCWarning(SESSION) << "Cannot create systemd Manager interface to restart" << mUnitName;
+        return;
+    }
+
+    // Delegate crash handling to systemd: reset failed counters then restart.
+    QDBusReply<void> resetReply =
+        manager.call(QStringLiteral("ResetFailedUnit"), mUnitName);
+    if (!resetReply.isValid()) {
+        qCWarning(SESSION) << "ResetFailedUnit failed for" << mUnitName
+                           << ":" << resetReply.error().message();
+        // continue and try restart anyway
+    }
+
+    QDBusReply<QDBusObjectPath> reply =
+        manager.call(QStringLiteral("RestartUnit"), mUnitName, QStringLiteral("replace"));
+    if (!reply.isValid()) {
+        qCWarning(SESSION) << "Failed to RestartUnit" << mUnitName
+                           << ":" << reply.error().message();
+    }
 }
